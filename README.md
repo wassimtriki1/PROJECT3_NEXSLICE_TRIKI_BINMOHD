@@ -171,3 +171,136 @@ Ce gain de 40% est critique. Dans un réseau mobile, 20 secondes de congestion e
 
 #### 8.4. Conclusion
 Ce projet démontre qu'une approche prédictive légère (Régression Linéaire) couplée à une métrique proxy robuste (CPU) suffit à surpasser significativement les standards industriels. En contournant les difficultés d'implémentation des sondes réseau complexes (iPerf) au profit d'une métrique native corrélée, nous avons fourni une solution plus stable et plus rapide.
+
+## 9. Guide de Reproduction et Scripts
+Conformément aux consignes, l'intégralité des commandes et scripts nécessaires à la reproduction de notre prototype sont détaillés ci-dessous. Vous pouvez copier ces blocs pour recréer l'environnement.
+
+### 9.1. Prérequis
+Un cluster Kubernetes (K3s recommandé) avec NexSlice déployé.  
+kubectl et helm installés.
+
+### 9.2. Installation de l'Environnement (PHPA & Monitoring)
+Exécutez les commandes suivantes pour installer le contrôleur prédictif et configurer la liaison avec Prometheus.
+
+    # 1. Ajout des dépôts Helm
+    helm repo add predictive-horizontal-pod-autoscaler https://jthomperoo.github.io/predictive-horizontal-pod-autoscaler
+    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    helm repo update
+
+    # 2. Installation du Contrôleur PHPA
+    # Note : Nous forçons l'image 'latest' pour corriger un bug de version connu
+    git clone https://github.com/jthomperoo/predictive-horizontal-pod-autoscaler.git /tmp/phpa
+    helm install phpa /tmp/phpa/helm --namespace nexslice
+    kubectl set image deployment/predictive-horizontal-pod-autoscaler predictive-horizontal-pod-autoscaler=jthomperoo/predictive-horizontal-pod-autoscaler:latest -n nexslice
+
+    # 3. Configuration et Installation de l'Adapter Prometheus
+    # Création du fichier de configuration pour exposer les métriques
+    cat <<EOF > adapter-values.yaml
+    prometheus-adapter:
+      rules:
+        default: false
+        custom:
+          - seriesQuery: '{__name__=~"^container_network_receive_bytes_total",namespace!="",pod!=""}'
+            resources:
+              overrides:
+                namespace: {resource: "namespace"}
+                pod: {resource: "pod"}
+            name:
+              matches: "^container_network_receive_bytes_total"
+              as: "pod_network_throughput"
+            metricsQuery: "sum(rate(<<.Series>>{<<.LabelMatchers>>}[1m])) by (<<.GroupBy>>)"
+    EOF
+
+    # Installation de l'adapter (Adapter l'URL prometheus si nécessaire)
+    helm install prometheus-adapter prometheus-community/prometheus-adapter \
+      --namespace nexslice \
+      --set prometheus.url=http://prometheus-server.monitoring.svc \
+      --set prometheus.port=80 \
+      -f adapter-values.yaml
+
+    # 4. Patch de Robustesse pour le Metrics Server (Indispensable sous K3s)
+    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+    kubectl patch deployment metrics-server -n kube-system --patch '{"spec": {"template": {"spec": {"hostNetwork": true}}}}'
+    kubectl patch deployment metrics-server -n kube-system --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+
+### 9.3. Comparaison A/B : Protocole de Test
+Étape 0 : Réinitialisation (Le Grand Reset)  
+Avant chaque test, lancez ces commandes pour remettre le cluster à un état stable (1 pod, pas de charge).
+
+    # Supprimer les scalers
+    kubectl delete hpa upf-standard -n nexslice --ignore-not-found=true
+    kubectl delete phpa upf-predictive-scaler -n nexslice --ignore-not-found=true
+
+    # Remettre à 1 replica
+    kubectl scale deployment oai-upf --replicas=1 -n nexslice
+
+    # Tuer le pod pour arrêter les processus de charge fantômes
+    kubectl delete pods -n nexslice -l app.kubernetes.io/name=oai-upf
+
+    echo "⏳ Attendez 2 minutes que les courbes Prometheus retombent à 0."
+
+Scénario A : Test du HPA Standard  
+Créer le fichier hpa-standard.yaml :
+
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    metadata:
+      name: upf-standard
+      namespace: nexslice
+    spec:
+      scaleTargetRef:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: oai-upf
+      minReplicas: 1
+      maxReplicas: 5
+      metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 50
+
+Appliquer et Lancer la charge :
+
+    kubectl apply -f hpa-standard.yaml
+    # Lancement de l'attaque CPU (dure 120s)
+    POD=$(kubectl get pod -n nexslice -l app.kubernetes.io/name=oai-upf -o jsonpath="{.items[0].metadata.name}")
+    kubectl exec -it $POD -n nexslice -- /bin/sh -c "yes > /dev/null & yes > /dev/null & yes > /dev/null & sleep 120"
+
+Scénario B : Test du PHPA Prédictif  
+Créer le fichier phpa-linear.yaml :
+
+    apiVersion: jamiethompson.me/v1alpha1
+    kind: PredictiveHorizontalPodAutoscaler
+    metadata:
+      name: upf-predictive-scaler
+      namespace: nexslice
+    spec:
+      scaleTargetRef:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: oai-upf
+      minReplicas: 1
+      maxReplicas: 5
+      metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 40
+      models:
+      - type: Linear
+        name: simple-linear
+        linear:
+          lookAhead: 10000
+          historySize: 6
+
+Appliquer et Lancer la charge :
+
+    kubectl apply -f phpa-linear.yaml
+    # Lancement de la même attaque
+    POD=$(kubectl get pod -n nexslice -l app.kubernetes.io/name=oai-upf -o jsonpath="{.items[0].metadata.name}")
+    kubectl exec -it $POD -n nexslice -- /bin/sh -c "yes > /dev/null & yes > /dev/null & yes > /dev/null & sleep 120"
